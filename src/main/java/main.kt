@@ -1,29 +1,46 @@
+import co.selim.thumbnail4j.createThumbnail
 import io.javalin.Javalin
+import io.javalin.http.Context
 import io.javalin.http.NotFoundResponse
+import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.*
 import kotlin.io.path.*
 
-private val coversPath = Paths.get("/Users/selim/covers")
-private val thumbnailsPath = Paths.get("/Users/selim/thumbnails")
-private val photosPath = Paths.get("/Users/selim/photos")
+private val homeDirectoryPath = Paths.get(System.getProperty("user.home"))
+private val coversPath = homeDirectoryPath.resolve("covers")
+private val thumbnailsPath = homeDirectoryPath.resolve("thumbnails")
+private val photosPath = homeDirectoryPath.resolve("photos")
 private val permittedFileExtensions = setOf("jpg", "jpeg")
 
 fun main() {
+    val albums: MutableMap<String, Album> = coversPath.readAlbums()
+        .onEach { (albumId, album) ->
+            if (Files.notExists(album.path)) {
+                error("Album path '${album.path}' not found for album with id $albumId")
+            }
+            if (Files.notExists(album.coverPhoto)) {
+                error("Album cover '${album.coverPhoto}' not found for album with id $albumId")
+            }
+            album.photos.forEach { (photoId, photo) ->
+                if (Files.notExists(photo.path)) {
+                    error("Photo with id '$photoId' not found in ${photo.path}")
+                }
+                if (Files.notExists(photo.thumbnailPath)) {
+                    error("Thumbnail for photo with id '$photoId' not found in ${photo.thumbnailPath}")
+                }
+            }
+        }
+
     val app = Javalin.create { config ->
         config.showJavalinBanner = false
     }.start(8080)
 
-    val albums = coversPath.readAlbumCovers()
-        .onEach { (_, albumCover) ->
-            if (Files.notExists(albumCover.path) || Files.notExists(albumCover.coverPhoto)) {
-                error("file not found!!!")
-            }
-        }
+    app.get("/") { ctx -> ctx.redirect("/albums") }
 
-    app.get("/") { ctx ->
+    app.get("/albums") { ctx ->
         val html = buildString {
             append("<html>")
             append("<ul>")
@@ -31,7 +48,7 @@ fun main() {
                 append("<li>")
                 append("""<a href="/albums/$albumId">""")
                 append("""<img width="128px" src="/albums/$albumId/thumbnail">""")
-                append("${album.name}")
+                append(album.name)
                 append("</a>")
                 append("</li>")
             }
@@ -48,7 +65,7 @@ fun main() {
         val html = buildString {
             append("<html>")
             append("<ul>")
-            for ((photoId, photo) in album.photos) {
+            for ((photoId, _) in album.photos) {
                 append("""<li><img width="128px" src="/albums/$albumId/photos/${photoId}"></li>""")
             }
             append("</ul>")
@@ -63,20 +80,39 @@ fun main() {
         val photoId = ctx.pathParam("photoId")
         val photo = album.photos[photoId] ?: throw NotFoundResponse()
 
-        ctx.contentType("image/jpeg")
-            .result(Files.newInputStream(photo.path))
+        ctx.sendJpegImage(photo.path)
     }
 
     app.get("/albums/{albumId}/thumbnail") { ctx ->
         val albumId = ctx.pathParam("albumId")
         val album = albums[albumId] ?: throw NotFoundResponse()
 
-        ctx.contentType("image/jpeg")
-            .result(Files.newInputStream(album.coverPhoto))
+        ctx.sendJpegImage(album.coverPhoto)
+    }
+
+    app.post("/albums/{albumId}/upload") { ctx ->
+        val albumId = ctx.pathParam("albumId")
+        val album = albums[albumId] ?: throw NotFoundResponse()
+
+        ctx.uploadedFiles().forEach { file ->
+            val fileName = randomString(24) + ".jpg"
+
+            val thumbnailPath = album.coverPhoto.resolveSibling(fileName)
+            val thumbnailImage = file.content.createThumbnailAndReset(1024)
+            Files.write(thumbnailPath, thumbnailImage)
+
+            val photoPath = album.path.resolve(fileName)
+            val highResImage = file.content.createThumbnailAndReset(2048)
+            Files.write(photoPath, highResImage)
+
+            val photoEntry = photoPath.nameWithoutExtension to Photo(photoPath, thumbnailPath)
+            albums[albumId] = album.copy(photos = album.photos + photoEntry)
+        }
+        ctx.result("OK")
     }
 }
 
-private fun Path.readAlbumCovers(): SortedMap<String, Album> = bufferedReader()
+private fun Path.readAlbums(): SortedMap<String, Album> = bufferedReader()
     .lineSequence()
     .filter { line -> line.contains("=") }
     .associate { line ->
@@ -95,11 +131,11 @@ private fun Path.readAlbumCovers(): SortedMap<String, Album> = bufferedReader()
             .associate { photoPath ->
                 photoPath.nameWithoutExtension to Photo(
                     photoPath,
-                    thumbnailsPath.resolve(photoPath.fileName.pathString)
+                    thumbnailsPath.resolve(indexedAlbumName).resolve(photoPath.fileName.pathString)
                 )
             }
 
-        albumPath.fileName.pathString to Album(name, coverPath, albumPath, photos)
+        indexedAlbumName to Album(name, coverPath, albumPath, photos)
     }
     .toSortedMap()
 
@@ -115,5 +151,10 @@ data class Photo(
     val thumbnailPath: Path,
 )
 
-private val Photo.thumbnailId: String
-    get() = thumbnailsPath.nameWithoutExtension
+private fun Context.sendJpegImage(path: Path) {
+    contentType("image/jpeg")
+        .header("Cache-Control", "public, max-age=604800, immutable")
+        .result(Files.newInputStream(path))
+}
+
+private fun InputStream.createThumbnailAndReset(px: Int) = createThumbnail(px).also { reset() }
